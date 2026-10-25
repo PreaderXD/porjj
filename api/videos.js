@@ -6,17 +6,34 @@ function send(res, status, payload) {
   return res.end(JSON.stringify(payload));
 }
 
+function toVideo(row) {
+  return {
+    id: row.id,
+    title: row.title,
+    description: row.description ?? '',
+    name: row.name ?? '',
+    link: row.link,
+    thumbnail: {
+      type: row.thumbnail_type ?? 'initial',
+      text: row.thumbnail_text ?? (row.title || '').slice(0, 1).toUpperCase(),
+      shape: row.thumbnail_shape ?? 'circle'
+    },
+    createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : row.created_at,
+    updatedAt: row.updated_at instanceof Date ? row.updated_at.toISOString() : row.updated_at,
+    published: Boolean(row.published)
+  };
+}
+
 function validVideos(value) {
-  if (!value || !Array.isArray(value.videos)) return false;
-  if (value.videos.length > 2000) return false;
+  if (!value || !Array.isArray(value.videos) || value.videos.length > 2000) return false;
   const ids = new Set();
   for (const v of value.videos) {
     if (!v || typeof v !== 'object') return false;
     if (typeof v.id !== 'string' || !v.id.trim() || ids.has(v.id)) return false;
     ids.add(v.id);
     if (typeof v.title !== 'string' || !v.title.trim() || v.title.length > 300) return false;
-    if (typeof v.description !== 'string' || v.description.length > 10000) return false;
-    if (typeof v.name !== 'string' || v.name.length > 200) return false;
+    if (typeof (v.description ?? '') !== 'string' || (v.description ?? '').length > 10000) return false;
+    if (typeof (v.name ?? '') !== 'string' || (v.name ?? '').length > 200) return false;
     if (typeof v.link !== 'string' || v.link.length > 2048) return false;
     let url;
     try { url = new URL(v.link); } catch { return false; }
@@ -27,43 +44,71 @@ function validVideos(value) {
 }
 
 export default async function handler(req, res) {
-  if (!['GET', 'PUT', 'POST', 'OPTIONS'].includes(req.method)) {
-    res.setHeader('Allow', 'GET, PUT, POST, OPTIONS');
+  if (!['GET', 'PUT', 'OPTIONS'].includes(req.method)) {
+    res.setHeader('Allow', 'GET, PUT, OPTIONS');
     return send(res, 405, { error: 'Method not allowed.' });
   }
   if (req.method === 'OPTIONS') return send(res, 204, {});
 
-  const databaseUrl = process.env.DATABASE_URL;
-  if (!databaseUrl) return send(res, 500, { error: 'DATABASE_URL is not configured in Vercel.' });
-  const sql = neon(databaseUrl);
+  if (!process.env.DATABASE_URL) {
+    return send(res, 500, { error: 'DATABASE_URL is not configured in Vercel project environment variables.' });
+  }
+  const sql = neon(process.env.DATABASE_URL);
 
   try {
-    await sql`CREATE TABLE IF NOT EXISTS chicken_store (
-      id INTEGER PRIMARY KEY CHECK (id = 1),
-      videos JSONB NOT NULL DEFAULT '{"videos": []}'::jsonb,
+    // Safe to run repeatedly; creates the structured table if it is not there yet.
+    await sql`CREATE TABLE IF NOT EXISTS chicken_videos (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      name TEXT NOT NULL DEFAULT '',
+      link TEXT NOT NULL,
+      thumbnail_type TEXT NOT NULL DEFAULT 'initial',
+      thumbnail_text TEXT NOT NULL DEFAULT '',
+      thumbnail_shape TEXT NOT NULL DEFAULT 'circle',
+      published BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )`;
-    await sql`INSERT INTO chicken_store (id, videos) VALUES (1, '{"videos": []}'::jsonb) ON CONFLICT (id) DO NOTHING`;
 
     if (req.method === 'GET') {
-      const rows = await sql`SELECT videos FROM chicken_store WHERE id = 1`;
-      return send(res, 200, rows[0]?.videos ?? { videos: [] });
+      const configuredKey = process.env.CHICKEN_ADMIN_KEY;
+      const suppliedKey = req.headers['x-chicken-admin-key'];
+      const isAdmin = Boolean(configuredKey && typeof suppliedKey === 'string' && suppliedKey.length === configuredKey.length && suppliedKey === configuredKey);
+      const rows = isAdmin
+        ? await sql`SELECT * FROM chicken_videos ORDER BY created_at DESC`
+        : await sql`SELECT * FROM chicken_videos WHERE published = TRUE ORDER BY created_at DESC`;
+      return send(res, 200, { videos: rows.map(toVideo) });
     }
 
     const adminKey = process.env.CHICKEN_ADMIN_KEY;
-    if (!adminKey) return send(res, 500, { error: 'CHICKEN_ADMIN_KEY is not configured in Vercel.' });
+    if (!adminKey) return send(res, 500, { error: 'CHICKEN_ADMIN_KEY is not configured in Vercel environment variables.' });
     const providedKey = req.headers['x-chicken-admin-key'];
     if (typeof providedKey !== 'string' || providedKey.length !== adminKey.length || providedKey !== adminKey) {
       return send(res, 401, { error: 'Admin key is missing or incorrect.' });
     }
 
     const body = req.body;
-    if (!validVideos(body)) return send(res, 400, { error: 'Invalid data. Expected { "videos": [...] } with valid unique IDs, titles, HTTP(S) links, and published flags.' });
+    if (!validVideos(body)) {
+      return send(res, 400, { error: 'Invalid data. Expected {"videos": [...]} with unique IDs, titles, HTTP(S) links, and published flags.' });
+    }
 
-    await sql`UPDATE chicken_store SET videos = ${JSON.stringify(body)}::jsonb, updated_at = NOW() WHERE id = 1`;
+    // Replace the stored collection in a single database transaction.
+    const queries = [sql`DELETE FROM chicken_videos`];
+    for (const v of body.videos) {
+      const thumb = v.thumbnail && typeof v.thumbnail === 'object' ? v.thumbnail : {};
+      queries.push(sql`INSERT INTO chicken_videos
+        (id, title, description, name, link, thumbnail_type, thumbnail_text, thumbnail_shape, published, created_at, updated_at)
+        VALUES (
+          ${v.id}, ${v.title}, ${v.description ?? ''}, ${v.name ?? ''}, ${v.link},
+          ${thumb.type ?? 'initial'}, ${thumb.text ?? v.title.slice(0, 1).toUpperCase()}, ${thumb.shape ?? 'circle'},
+          ${v.published}, ${v.createdAt ? new Date(v.createdAt) : new Date()}, ${v.updatedAt ? new Date(v.updatedAt) : new Date()}
+        )`);
+    }
+    await sql.transaction(queries);
     return send(res, 200, { ok: true, count: body.videos.length });
   } catch (error) {
     console.error('Chicken videos API error:', error);
-    return send(res, 500, { error: 'Server error while accessing the video database.' });
+    return send(res, 500, { error: 'Database request failed. Check the Vercel function logs for details.' });
   }
 }
