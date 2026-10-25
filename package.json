@@ -1,0 +1,10 @@
+{
+  "name": "chicken-video-site",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Chicken video website for Vercel with Neon PostgreSQL storage",
+  "dependencies": {
+    "@neondatabase/serverless": "^1.0.2"
+  }
+}
